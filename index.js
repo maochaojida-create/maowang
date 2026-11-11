@@ -1,4 +1,4 @@
-/* Siren Voice TT/iOS adaptation 2.3.1-tt.2. Original: Ellina / https://github.com/Ellinav/Siren-Voice (aef6bb5ee443488edd6c0ef1e28468c9218e1975). CC BY-NC 4.0; see LICENSE.txt. Modified 2026-10-19: bounded media lifecycle, metadata-only cache checks, TT/iOS lazy sentence playback. */
+/* Siren Voice TT/iOS adaptation 2.3.1-tt.1. Original: Ellina / https://github.com/Ellinav/Siren-Voice (aef6bb5ee443488edd6c0ef1e28468c9218e1975). CC BY-NC 4.0; see LICENSE.txt. Modified 2026-10-19: bounded media lifecycle, metadata-only cache checks, TT/iOS lazy sentence playback. */
 var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res, err) => function __init() {
@@ -5600,9 +5600,6 @@ window["playSirenMusicInline"] = async function(element, title, artist) {
 };
 var sirenCardObserver = null;
 var observerTimeout = null;
-// Keep rendered voice text untouched while TT is rebuilding a streaming message.
-// A single final cleanup after generation avoids alternating raw/cleaned lengths.
-var sirenSpeakStreamActive = false;
 async function handleInlineMusicPlay(element, title, artist = "", floor = null) {
   try {
     console.log(
@@ -5662,9 +5659,6 @@ async function handleInlineMusicPlay(element, title, artist = "", floor = null) 
   }
 }
 function bindInlineSpeakCards(root = document) {
-  // TT may replace the very same speech card several times per second.
-  // Do not rewrite text during generation: its source HTML is still changing.
-  if (sirenSpeakStreamActive) return;
   const cards = root.querySelectorAll('[data-siren-speak="1"]');
   if (!cards.length) return;
   cards.forEach((card) => {
@@ -5685,6 +5679,7 @@ function bindInlineSpeakCards(root = document) {
         textSpan.innerHTML = cleanDisplay;
       }
     }
+    if (card.dataset.sirenBound === "1") return;
     card.dataset.sirenBound = "1";
   });
 }
@@ -5864,15 +5859,6 @@ function initEvents() {
   const context = SillyTavern.getContext();
   const eventSource = context.eventSource;
   const event_types = context.event_types;
-  eventSource.on("generation_started", () => {
-    sirenSpeakStreamActive = true;
-  });
-  const finalizeSirenSpeakDisplay = () => {
-    sirenSpeakStreamActive = false;
-    bindInlineSpeakCards(document);
-  };
-  // Some TT builds emit stopped on cancellation rather than ended.
-  eventSource.on("generation_stopped", finalizeSirenSpeakDisplay);
   const messageEvent = event_types.MESSAGE_RECEIVED || "message_received";
   eventSource.on(messageEvent, async () => await handleNewMessage());
   const messageEditedEvent = event_types.MESSAGE_EDITED || "message_edited";
@@ -5904,7 +5890,6 @@ function initEvents() {
     await handleNewMessage();
   });
   eventSource.on("generation_ended", async () => {
-    finalizeSirenSpeakDisplay();
     console.log("[Siren Voice] \u{1F3C1} \u68C0\u6D4B\u5230 AI \u751F\u6210\u5B8C\u6BD5\uFF0C\u6B63\u5728\u6253\u635E\u6DF1\u6D77\u6F5C\u6D41...");
     await handleNewMessage();
     await injectScenePlayButtons();
@@ -5921,7 +5906,6 @@ function initEvents() {
     cancelPendingTtsRequests();
   });
   eventSource.on("chat_id_changed", async (...args) => {
-    finalizeSirenSpeakDisplay();
     stopCurrentTTS();
     stopScenePlayback();
     cancelPendingTtsRequests();
@@ -6075,7 +6059,7 @@ function initEvents() {
                     );
                     targetIndex = allCards.indexOf(speakTarget);
                   }
-                  const regex = /<(speak|inner|phone)\b([^>]*)>((?:(?!<(?:speak|inner|phone)\b)[\s\S])*?)<\/\1>/gi;
+                  const regex = /<(speak|inner|phone)\b([^>]*)>((?:(?!<(?:speak|inner|phone)\b)[\s\S])*?)<\/(?:\1|(?!(?:i|b|u|s|em|strong|span|a|p|br)\b)[a-zA-Z0-9_-]+)>/gi;
                   let match;
                   let currentMatchIndex = 0;
                   while ((match = regex.exec(originalMarkdown)) !== null) {
@@ -6418,7 +6402,7 @@ function buildSpeakRegexes() {
       enabled: true,
       run_on_edit: true,
       scope: "global",
-      find_regex: `/<${tag}\\b([^>]*)>((?:(?!<(?:speak|inner|phone)\\b)[\\s\\S])*?)<\\/${tag}>/gi`,
+      find_regex: `/<${tag}\\b([^>]*)>((?:(?!<(?:speak|inner|phone)\\b)[\\s\\S])*?)<\\/(?:${tag}|(?!(?:i|b|u|s|em|strong|span|a|p|br)\\b)[a-zA-Z0-9_-]+)>/gi`,
       // 👇 主要修改这里：最外层加了一个 <span style="display: block; width: 100%;">，并在末尾加上 </span>
       replace_string: `<span style="display: block; width: 100%;"><span class="siren-speak-card" data-siren-speak="1" data-tag="${tag}" data-raw-attrs='$1' tabindex="0" style="display: flex; width: fit-content; margin-top: 6px; margin-bottom: 6px;">
     <span class="siren-btn-wrap siren-play-wrap" data-siren-action="play" title="\u64AD\u653E">
@@ -6454,28 +6438,7 @@ function buildSpeakRegexes() {
   return [
     createRegexConfig("speak", ""),
     createRegexConfig("inner", getIndicatorHtml("fa-solid fa-comment")),
-    createRegexConfig("phone", getIndicatorHtml("fa-solid fa-phone")),
-    // Last-resort display rule. During streaming an open speech tag must NOT
-    // be mistaken for a finished card; retain its raw text until the real
-    // closing tag arrives instead of showing unstable intermediate HTML.
-    {
-      id: "siren-voice-pending-speech-display",
-      script_name: "Siren-Voice-Auto-Pending-Speech",
-      enabled: true,
-      run_on_edit: true,
-      scope: "global",
-      find_regex: "/<(speak|inner|phone)\\b[^>]*>([\\s\\S]*)$/gi",
-      replace_string: '<span class="siren-stream-pending">$2</span>',
-      source: {
-        user_input: true,
-        ai_output: true,
-        slash_command: true,
-        world_info: false
-      },
-      destination: { display: true, prompt: false },
-      min_depth: null,
-      max_depth: null
-    }
+    createRegexConfig("phone", getIndicatorHtml("fa-solid fa-phone"))
   ];
 }
 async function updateSirenRegex(styles) {
@@ -8898,6 +8861,13 @@ function bindMinimaxEvents() {
     currentEditingRow = null;
   });
   $("#siren-mm-save-all").off("click").on("click", async function(e, isSilent = false) {
+// 🔧 【MiniMax 音色删除修复补丁】强制清空旧音色，防止酒馆底层合并导致删不掉
+    const cContext = SillyTavern.getContext();
+    if (cContext && cContext.characterId !== undefined && cContext.characterId !== null) {
+        const oldExt = cContext.characters[cContext.characterId]?.data?.extensions?.siren_voice_tts_minimax;
+        if (oldExt) oldExt.voices = {}; 
+    }
+    // 🔧 【补丁结束】
     const settings2 = getSirenSettings();
     settings2.tts.minimax.region = $("#siren-mm-region").val();
     settings2.tts.minimax.api_key = $("#siren-mm-apikey").val().trim();
