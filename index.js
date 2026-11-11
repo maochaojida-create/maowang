@@ -8861,13 +8861,161 @@ function bindMinimaxEvents() {
     currentEditingRow = null;
   });
   $("#siren-mm-save-all").off("click").on("click", async function(e, isSilent = false) {
-// 🔧 【MiniMax 音色删除修复补丁】强制清空旧音色，防止酒馆底层合并导致删不掉
-    const cContext = SillyTavern.getContext();
-    if (cContext && cContext.characterId !== undefined && cContext.characterId !== null) {
-        const oldExt = cContext.characters[cContext.characterId]?.data?.extensions?.siren_voice_tts_minimax;
-        if (oldExt) oldExt.voices = {}; 
+  // ==========================================
+  // 🛡️ MiniMax 终极防回溯保存引擎 (移植自 GPT 修复版)
+  // ==========================================
+  let sirenMinimaxSaveBusy = false;
+
+  async function saveMinimaxVoiceMap(mapData) {
+    if (sirenMinimaxSaveBusy) {
+      window.toastr?.warning("MiniMax 配置正在保存，请稍候。");
+      return false;
     }
-    // 🔧 【补丁结束】
+    const context = SillyTavern.getContext();
+    const id = context.characterId;
+    const card = context.characters?.[id];
+    if (id === undefined || id === null || !card?.avatar || context.groupId) {
+      window.toastr?.warning("请进入对应角色的单人聊天后保存音色配置。");
+      return false;
+    }
+    if (typeof context.getRequestHeaders !== "function" ||
+        typeof context.writeExtensionField !== "function") {
+      window.toastr?.error("当前酒馆缺少角色卡保存接口，本次未修改配置。");
+      return false;
+    }
+
+    const avatar = card.avatar;
+    const key = "siren_voice_tts_minimax";
+    const voices = JSON.parse(JSON.stringify(mapData));
+    let previous;
+    let clearingStarted = false;
+    sirenMinimaxSaveBusy = true;
+
+    const post = async (url, body) => {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: context.getRequestHeaders(),
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) throw new Error(`角色卡接口 HTTP ${response.status}`);
+      return response;
+    };
+    const readCard = async () => {
+      const response = await post("/api/characters/get", { avatar_url: avatar });
+      const fresh = await response.json();
+      if (!fresh?.data?.extensions) throw new Error("无法读取角色卡扩展数据");
+      return fresh;
+    };
+    const clearVoices = async () => {
+      const writeVoices = (value) => post("/api/characters/merge-attributes", {
+        avatar,
+        data: { extensions: { [key]: { voices: value } } },
+      });
+      // 老版本酒馆需要通过 null 洗掉深层合并
+      await writeVoices(null);
+      await writeVoices({});
+    };
+    const writeConfig = async (value) => {
+      if (context.characters?.[id]?.avatar !== avatar) {
+        throw new Error("角色列表发生变化，请刷新后重试");
+      }
+      await context.writeExtensionField(id, key, value);
+    };
+    const canonical = (value) => {
+      if (Array.isArray(value)) return value.map(canonical);
+      if (value && typeof value === "object") {
+        return Object.fromEntries(Object.keys(value).sort().map(
+          (name) => [name, canonical(value[name])],
+        ));
+      }
+      return value;
+    };
+    const equalVoices = (a, b) =>
+      JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
+
+    try {
+      const fresh = await readCard();
+      previous = JSON.parse(JSON.stringify(fresh.data.extensions[key] || {}));
+      const removed = Object.keys(previous.voices || {}).filter(
+        (name) => !Object.prototype.hasOwnProperty.call(voices, name),
+      );
+      
+      if (removed.length) {
+        // 备份并强制清空旧音色
+        localStorage.setItem(`siren_minimax_delete_backup_v1:${avatar}`, JSON.stringify({
+          avatar, saved_at: new Date().toISOString(), config: previous,
+        }));
+        clearingStarted = true;
+        await clearVoices();
+      }
+      
+      await writeConfig({ ...previous, voices });
+      
+      const verified = await readCard();
+      if (!equalVoices(verified.data.extensions[key]?.voices, voices)) {
+        throw new Error("保存后校验不通过，磁盘配置与音色列表不一致");
+      }
+      return true;
+    } catch (error) {
+      console.error("[Siren Voice] MiniMax 配置保存失败:", error);
+      if (clearingStarted && previous) {
+        try {
+          await clearVoices();
+          await writeConfig(previous);
+          const restored = await readCard();
+          if (!equalVoices(restored.data.extensions[key]?.voices, previous.voices || {})) {
+            throw new Error("恢复校验失败");
+          }
+          window.toastr?.error("MiniMax 保存失败，已恢复原音色配置。请刷新后重试。");
+        } catch (restoreError) {
+          console.error("[Siren Voice] MiniMax 恢复失败:", restoreError);
+          window.toastr?.error("保存中断。原配置备份保存在当前浏览器中，请先保留此浏览器数据。");
+        }
+      } else {
+        window.toastr?.error("MiniMax 保存失败，请检查酒馆连接及浏览器存储后重试。");
+      }
+      return false;
+    } finally {
+      sirenMinimaxSaveBusy = false;
+    }
+  }
+
+  // 重新绑定保存按钮
+  $("#siren-mm-save-all").off("click").on("click", async function (e, isSilent = false) {
+    const settings = getSirenSettings();
+    settings.tts.minimax.region = $("#siren-mm-region").val();
+    settings.tts.minimax.api_key = $("#siren-mm-apikey").val().trim();
+    settings.tts.minimax.model = $("#siren-mm-model").val();
+    settings.tts.minimax.text_norm = $("#siren-mm-norm").is(":checked");
+    saveSirenSettings(true);
+
+    const mapData = {};
+    $("#siren-mm-char-list .siren-mm-char-item").each(function () {
+      const charName = $(this).find(".mm-char-name").val().trim();
+      const voiceId = $(this).find(".mm-voice-id").val();
+      if (charName && voiceId) {
+        const advDataStr = decodeURIComponent($(this).find(".mm-adv-data").val());
+        let advData = getDefaultMinimaxAdvData();
+        try {
+          advData = { ...advData, ...JSON.parse(advDataStr) };
+        } catch (e) {}
+        mapData[charName] = { voice_id: voiceId, ...advData };
+      }
+    });
+
+    // 调用终极防回溯引擎
+    const isSaved = await saveMinimaxVoiceMap(mapData);
+    if (!isSaved) return;
+
+    if (!isSilent && window.toastr) {
+      window.toastr.success("MiniMax: 配置已保存，已自动切换并同步世界书！");
+    }
+    const currentSettings = getSirenSettings();
+    currentSettings.tts.provider = "minimax";
+    currentSettings.tts.enabled = true;
+    saveSirenSettings(true);
+    await syncTtsWorldbookEntries("minimax", true);
+  });
     const settings2 = getSirenSettings();
     settings2.tts.minimax.region = $("#siren-mm-region").val();
     settings2.tts.minimax.api_key = $("#siren-mm-apikey").val().trim();
