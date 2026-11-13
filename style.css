@@ -893,7 +893,7 @@
    ========================================== */
 [data-siren-speak="1"] {
   display: inline-flex !important;
-  width: fit-content !important;
+  width: 100% !important;
   align-items: center;
   gap: 12px;
   margin: 6px 0;
